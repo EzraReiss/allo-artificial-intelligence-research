@@ -10,18 +10,22 @@ from gurobipy import GurobiError
 from allo.customize import Partition as partition
 from allo.ir.utils import MockBuffer
 
-TILE_SIZE = 16
 L = 64
+TILE_SIZE = 16
 unroll_factor = L//TILE_SIZE
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
 
-def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     # TEMP for exponentials
+def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     
     QK_out: Ty[L, L] = 0.0
-    i_arr: int32[L*L]
-    exp_buf_1: Ty[L] 
-    exp_buf_2: Ty[L] 
+    exp_buf: Ty[L, L] = 0.0
+    invs: Ty[L] = 0.0
+    preprocess_softmax(QK_in, exp_buf, invs)
+    softmax_p4(QK_out, exp_buf, invs)
+    return QK_out
 
+def preprocess_softmax(QK_in: Ty[L, L], exp_buf: Ty[L,L], invs: Ty[L]):   
+    i_arr: int32[L*L]
     for i in allo.grid(L*L, name = "i"):
         x: index = i
         i_arr[i] = x
@@ -29,10 +33,8 @@ def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     # TEMP for exponentials
     for i_outer in allo.grid(L//TILE_SIZE, name = "i_outer"):
         for i_inner in allo.grid(TILE_SIZE, name = "i_inner"):
             max_val = softmax_p1(QK_in, i_arr[i_outer*TILE_SIZE + i_inner])
-            softmax_p2(QK_in, max_val, exp_buf_1, exp_buf_2, i_arr[i_outer*TILE_SIZE + i_inner])
-            inv = softmax_p3(exp_buf_1)
-            softmax_p4(QK_out, exp_buf_2, inv, i_arr[i_outer*TILE_SIZE + i_inner])
-    return QK_out
+            softmax_p2(QK_in, max_val, exp_buf, invs, i_arr[i_outer*TILE_SIZE + i_inner])
+            #invs[i_outer*TILE_SIZE + i_inner] = softmax_p3(exp_buf)
 
 def softmax_p1(QK_in: Ty[L, L], i_pos: int32) -> Ty:
     local_max: Ty = MIN_FLOAT32
@@ -42,28 +44,30 @@ def softmax_p1(QK_in: Ty[L, L], i_pos: int32) -> Ty:
         local_max = v if v > m else m  
     return local_max
 
-def softmax_p2(QK_in: Ty[L, L], max_val: Ty, exp_buf_1: Ty[L], exp_buf_2: Ty[L], i_pos: int32): # ->  Ty[L]:
+def softmax_p2(QK_in: Ty[L, L], max_val: Ty, exp_buf: Ty[L, L], invs: Ty[L], i_pos: int32):
     local_max: Ty = max_val
     #exp_buf: Ty[L] = 0.0
-    # exp_buf_1: Ty[L] = 0.0
-    # exp_buf_2: Ty[L] = 0.0
     for j2 in allo.grid(L, name = "j2"):
         e:Ty = allo.exp(QK_in[i_pos, j2] - local_max)
-        exp_buf_1[j2] = e
-        exp_buf_2[j2] = e
-    #return exp_buf
- 
+        exp_buf[i_pos, j2] = e
 
-def softmax_p3(exp_buf: Ty[L]) -> Ty:
     row_total: Ty = 0.0
     for j3 in allo.grid(L, name = "j3"):
-        row_total += exp_buf[j3]
+        row_total += exp_buf[i_pos, j3]
     inv:Ty = 1.0 / row_total #this does not catch a division by zero
-    return inv
+    invs[i_pos] = inv
+    #return exp_buf
 
-def softmax_p4(QK_out: Ty[L, L], exp_buf: Ty[L], inv: Ty, i_pos: int32):
-    for j4 in allo.grid(L, name = "j4"):
-        QK_out[i_pos, j4] = exp_buf[j4] * inv
+# def softmax_p3(exp_buf: Ty[L]) -> Ty:
+#     row_total: Ty = 0.0
+#     for j3 in allo.grid(L, name = "j3"):
+#         row_total += exp_buf[j3]
+#     inv:Ty = 1.0 / row_total #this does not catch a division by zero
+#     return inv
+
+def softmax_p4(QK_out: Ty[L, L], exp_buf_copy: Ty[L, L], invs: Ty[L]):
+    for i4, j4 in allo.grid(L, L, name = "output_loop"):
+        QK_out[i4, j4] = exp_buf_copy[i4, j4] * invs[i4]
 
 def true_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
     exp_buf:Ty[L, L] = 0.0      # TEMP for exponentials
@@ -99,26 +103,10 @@ def test_function_equivalence():
     QK_out_base = np.zeros((L, L), dtype=np.float32)
     QK_out_opt = np.zeros((L, L), dtype=np.float32)
     base_sch = allo.customize(true_softmax)
-
-    s1 = allo.customize(softmax_p1)
-    s2 = allo.customize(softmax_p2)
-    s3 = allo.customize(softmax_p3)
-    s4 = allo.customize(softmax_p4)
-    top_sch = allo.customize(softmax_top)
-
-    top_sch.partition(top_sch.QK_in, partition_type=partition.Cyclic, dim=1, factor = unroll_factor)
-    top_sch.partition(top_sch.i_arr, partition_type=partition.Cyclic, dim=1, factor = 16)
-    top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=1, factor = 16)
-
-    # compose the lower level schedules into top_sch
-    top_sch.compose([s1, s2, s3, s4])
-
-    top_sch.unroll("i", 16)
-    top_sch.pipeline("i")
-
+    opt_sch = schedule_base()
 
     base_mod = base_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_top_opt.prj")(QK_in, QK_out_base)
-    opt_mod = top_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_top_opt.prj")(QK_in, QK_out_opt)
+    opt_mod = opt_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_top_opt.prj")(QK_in, QK_out_opt)
     np.testing.assert_allclose(QK_out_opt, QK_out_base,  rtol=1e-5, atol=1e-5)
     print("passed functional simulation 1")
 
@@ -126,8 +114,8 @@ def test_softmax_top():
     # create the schedules
     s1 = allo.customize(softmax_p1)
     s2 = allo.customize(softmax_p2)
-    s3 = allo.customize(softmax_p3)
     s4 = allo.customize(softmax_p4)
+    pre_sch = allo.customize(preprocess_softmax)
     top_sch = allo.customize(softmax_top)
 
     # # create fifo streams from the inner loop to softmax_p4
@@ -136,57 +124,60 @@ def test_softmax_top():
 
     # partitions
     top_sch.partition(top_sch.QK_in, partition_type=partition.Cyclic, dim=1, factor = unroll_factor)
-    top_sch.partition(top_sch.i_arr, partition_type=partition.Cyclic, dim=1, factor = 16)
-    #top_sch.partition(top_sch.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 16)
-    top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=2, factor = 16)
+    #top_sch.partition(top_sch.max_vals, partition_type=partition.Cyclic, dim=1, factor = 4)
+    top_sch.partition(top_sch.exp_buf, partition_type=partition.Cyclic, dim=0, factor = 16)
+    #top_sch.partition(top_sch.rows_total, partition_type=partition.Cyclic, dim=1, factor = 4)
+    top_sch.partition(top_sch.invs, partition_type=partition.Cyclic, dim=1, factor = 16)
+    top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=1, factor = 16)
 
     # schedule the lower level functions
-    # schedule_softmax_p1(s1)
-    # schedule_softmax_p2(s2)
-    # schedule_softmax_p3(s3)
-    # schedule_softmax_p4(s4)
-    
+    schedule_softmax_p1(s1)
+    schedule_softmax_p2(s2)
+    schedule_softmax_p4(s4)
 
-    # compose the lower level schedules into top_sch
-    top_sch.compose([s1, s2, s3, s4])
 
-    top_sch.unroll("i", 16)
-    top_sch.pipeline("i")
+    ### preprocess_softmax ###
+    # compose the lower level schedules into pre_sch
+    pre_sch.compose([s1, s2])
+
+    pre_sch.unroll("i", L)
+    pre_sch.pipeline("i")
 
     # unfold the inner loop and apply dataflow to the outer loop
-    #top_sch.dataflow(top_sch.get_loops("softmax_top")["i_outer"]["i_inner"])
-    #top_sch.unroll("i_outer", factor = 4)
-    #top_sch.unfold("i_outer", [0]) #unfold the outer loop
+    #pre_sch.dataflow(pre_sch.get_loops("preprocess_softmax")["i_outer"]["i_inner"])
+    #pre_sch.unroll("i_outer", factor = 4)
+    pre_sch.unfold("i_outer", [0]) #unfold the outer loop
     #top_sch.dataflow("softmax_top")
+
+    ### softmax_top ###
+    top_sch.compose([pre_sch, s4])
+
+    # top_sch.to(top_sch.exp_buf, "softmax_p4")
+    # top_sch.to(top_sch.invs, "softmax_p4")
     
     # build the top level schedule
-    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top_2.prj")()
+    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top.prj")()
 
 
 def schedule_softmax_p1(s):
     ### partitions are just here for bookkeeping ###
     # s.partition(s.QK_in, partition_type=partition.Cyclic, dim=1, factor = 4)
+    # s.partition(s.max_vals, partition_type=partition.Cyclic, dim=1, factor = 4)
     s.pipeline("j1")
     
 
 def schedule_softmax_p2(s):
-    ### partitions ###
-    #s.partition(s.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 4)
-    #s.unroll("j2", factor = 4)
-    s.pipeline("j2")
-
-
-def schedule_softmax_p3(s):
     ### partitions are just here for bookkeeping ###
-    #s.partition(s.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 4)
-    #s.unroll("j3", factor = 4)
-    s.pipeline("j3")
+    # s.partition(s.QK_in, partition_type=partition.Cyclic, dim=1, factor = 4)
+    s.pipeline("j2")
 
 
 def schedule_softmax_p4(s):
     ### partitions are just here for bookkeeping ###
+    # s.partition(s.exp_buf, partition_type=partition.Cyclic, dim=0, factor = 16)
     # s.partition(s.QK_out, partition_type=partition.Cyclic, dim=1, factor = 16)
-    #s.partition(s.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 16)
+    # s.partition(s.invs, partition_type=partition.Cyclic, dim=1, factor = 16)
+    s.reorder("j4", "i4")
     s.unroll("j4", factor = 16)
     s.pipeline("j4")
 
