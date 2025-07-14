@@ -26,14 +26,16 @@ def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:
 
 def preprocess_softmax(QK_in: Ty[L, L], exp_buf: Ty[L,L], invs: Ty[L]):   
     i_arr: int32[L*L]
+    i_arr_2: int32[L*L]
     for i in allo.grid(L*L, name = "i"):
         x: index = i
         i_arr[i] = x
+        i_arr_2[i] = x
 
     for i_outer in allo.grid(L//TILE_SIZE, name = "i_outer"):
         for i_inner in allo.grid(TILE_SIZE, name = "i_inner"):
             max_val = softmax_p1(QK_in, i_arr[i_outer*TILE_SIZE + i_inner])
-            softmax_p2(QK_in, max_val, exp_buf, invs, i_arr[i_outer*TILE_SIZE + i_inner])
+            softmax_p2(QK_in, max_val, exp_buf, invs, i_arr_2[i_outer*TILE_SIZE + i_inner])
             #invs[i_outer*TILE_SIZE + i_inner] = softmax_p3(exp_buf)
 
 def softmax_p1(QK_in: Ty[L, L], i_pos: int32) -> Ty:
@@ -144,7 +146,7 @@ def test_softmax_top():
     pre_sch.pipeline("i")
 
     # unfold the inner loop and apply dataflow to the outer loop
-    #pre_sch.dataflow(pre_sch.get_loops("preprocess_softmax")["i_outer"]["i_inner"])
+    pre_sch.dataflow(pre_sch.get_loops("preprocess_softmax")["i_outer"]["i_inner"])
     #pre_sch.unroll("i_outer", factor = 4)
     pre_sch.unfold("i_outer", [0]) #unfold the outer loop
     #top_sch.dataflow("softmax_top")
@@ -156,7 +158,7 @@ def test_softmax_top():
     # top_sch.to(top_sch.invs, "softmax_p4")
     
     # build the top level schedule
-    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top.prj")()
+    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_v4_stream.prj")()
 
 
 def schedule_softmax_p1(s):

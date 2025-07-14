@@ -19,45 +19,43 @@ MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
 def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     # TEMP for exponentials
     QK_out: Ty[L, L] = 0.0
     i_arr_1: int32[L*L]
-
+    invs: Ty[L]
+    exp_buf_1: Ty[L, L] 
     for i in allo.grid(L*L, name = "i"):
         x: index = i
         i_arr_1[i] = x
-
     for i_outer in allo.grid(L//TILE_SIZE, name = "i_outer"):
         for i_inner in allo.grid(TILE_SIZE, name = "i_inner"):
             max_val = softmax_p1(QK_in, i_arr_1[i_outer*TILE_SIZE + i_inner])
-            exp_buf_1 = softmax_p2(QK_in, max_val, i_arr_1[i_outer*TILE_SIZE + i_inner])
-            inv = softmax_p3(exp_buf_1)
-            softmax_p4(QK_out, exp_buf_1, inv, i_arr_1[i_outer*TILE_SIZE + i_inner])
+            softmax_p2(QK_in, max_val, i_arr_1[i_outer*TILE_SIZE + i_inner], exp_buf_1)
+            softmax_p3(exp_buf_1, i_arr_1[i_outer*TILE_SIZE + i_inner], invs)
+    softmax_p4(QK_out, exp_buf_1, invs)
     return QK_out
 
 def softmax_p1(QK_in: Ty[L, L], i_pos: int32) -> Ty:
     local_max: Ty = MIN_FLOAT32
     for j1 in allo.grid(L, name = "j1"):
-        if QK_in[i_pos, j1] > local_max:
-            local_max = QK_in[i_pos, j1]
+        v:Ty = QK_in[i_pos, j1]
+        m:Ty = local_max             
+        local_max = v if v > m else m  
     return local_max
 
-def softmax_p2(QK_in: Ty[L, L], max_val: Ty, i_pos: int32) -> Ty[L]:
+def softmax_p2(QK_in: Ty[L, L], max_val: Ty, i_pos: int32, exp_buf_1: Ty[L, L]):
     local_max: Ty = max_val
-    #exp_buf: Ty[L] = 0.0
-    exp_buf_1: Ty[L] = 0.0
     for j2 in allo.grid(L, name = "j2"):
         e:Ty = allo.exp(QK_in[i_pos, j2] - local_max)
-        exp_buf_1[j2] = e
-    return exp_buf_1
+        exp_buf_1[i_pos, j2] = e
 
-def softmax_p3(exp_buf: Ty[L]) -> Ty:
+def softmax_p3(exp_buf: Ty[L], i_pos: int32, invs: Ty[L]):
     row_total: Ty = 0.0
     for j3 in allo.grid(L, name = "j3"):
         row_total += exp_buf[j3]
     inv:Ty = 1.0 / row_total
-    return inv
+    invs[i_pos] = inv
 
-def softmax_p4(QK_out: Ty[L, L], exp_buf: Ty[L], inv: Ty, i_pos: int32):
-    for j4 in allo.grid(L, name = "result"):
-        QK_out[i_pos, j4] = exp_buf[j4] * inv
+def softmax_p4(QK_out: Ty[L, L], exp_buf_1: Ty[L, L], invs: Ty[L]):
+    for i4,j4 in allo.grid(L, name = "j4"):
+        QK_out[i4, j4] = exp_buf_1[i4, j4] * invs[i4]
 
 def true_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
     exp_buf:Ty[L, L] = 0.0      # TEMP for exponentials
@@ -113,14 +111,11 @@ def test_function_equivalence():
     top_sch.unroll("i", 16)
     top_sch.pipeline("i")
 
-    base_mod = base_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_true.prj")(QK_in, QK_out_base)
+
+    base_mod = base_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_top_opt.prj")(QK_in, QK_out_base)
     opt_mod = top_sch.build(target="vitis_hls", mode="sw_emu", project="sw_softmax_top_opt.prj")(QK_in, QK_out_opt)
     np.testing.assert_allclose(QK_out_opt, QK_out_base,  rtol=1e-5, atol=1e-5)
     print("passed functional simulation 1")
-
-def test_true_softmax():
-    s = allo.customize(true_softmax)
-    mod = s.build(target="vitis_hls", mode="csyn", project="true_softmax.prj")()
 
 def test_softmax_top():
     # create the schedules
@@ -137,7 +132,7 @@ def test_softmax_top():
     # partitions
     top_sch.partition(top_sch.QK_in, partition_type=partition.Cyclic, dim=0, factor = unroll_factor)
     top_sch.partition(top_sch.i_arr_1, partition_type=partition.Cyclic, dim=1, factor = 16)
-    #top_sch.partition(top_sch.invs, partition_type=partition.Cyclic, dim=1, factor = unroll_factor*2)
+    top_sch.partition(top_sch.invs, partition_type=partition.Cyclic, dim=1, factor = unroll_factor*2)
     #top_sch.partition(top_sch.i_arr, partition_type=partition.Cyclic, dim=1, factor = 16)
     #top_sch.partition(top_sch.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 16)
     top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=0, factor = 16)
@@ -157,12 +152,12 @@ def test_softmax_top():
 
     # unfold the inner loop and apply dataflow to the outer loop
     #top_sch.dataflow(top_sch.get_loops("softmax_top")["i_outer"]["i_inner"])
-    #top_sch.unroll("i_outer", factor = 2)
+    top_sch.unroll("i_outer", factor = 2)
     #top_sch.unfold("i_outer", [0]) #unfold the outer loop
     #top_sch.dataflow("softmax_top")
     
     # build the top level schedule
-    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top_best.prj")()
+    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top_3.prj")()
 
 
 def schedule_softmax_p1(s):
@@ -211,5 +206,4 @@ def test_base():
 if __name__ == "__main__":
     #test_base()
     test_softmax_top()
-    #test_true_softmax()
-    test_function_equivalence()
+    #test_function_equivalence()
