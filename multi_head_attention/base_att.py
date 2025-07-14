@@ -168,7 +168,7 @@ def test_attention():
     print(my_solution)
     print("-"*100)
     print(solution)
-    np.assert_allclose(my_solution, solution, atol=1e-5)
+    np.testing.assert_allclose(my_solution, solution, atol=1e-5)
     print("everything passed!")
 if __name__ == "__main__":
     test_attention()

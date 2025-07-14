@@ -16,7 +16,7 @@ from allo.ir.transform import find_buffer
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
 H, L, D = 8, 64, 1024
-P = H // 2 # parallel heads
+P = H // 1 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
@@ -139,7 +139,6 @@ def sdp(Q, K, V, H, D):
         context_i = np.matmul(Y, V_h)
         context[:, i * h_d : (i + 1) * h_d] = context_i
     return context
-
 
 def test_attention():
     Q = np.random.rand(L, D).astype(np.float32)
