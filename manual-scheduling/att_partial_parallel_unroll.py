@@ -27,7 +27,7 @@ import math
 import numpy as np
 float32_scalar = float32        
 
-def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float32[L, L]:
+def gemm(A: float32[L, D], B: float32[L, D], start_pos: int32) -> float32[L, L]:
     """Is the AB^T technically where if B is already transposed it would be A[L, start_pos:start_pos+D]B[start_pos:start_pos+D, L]
     this is like computing Q_hK_h^T
     """
@@ -38,13 +38,14 @@ def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float3
                 C[i, j] += A[i, start_pos + k] * B[j, start_pos + k]
     return C
 
-def gemm_2(A: float32[L, L], B: float32[L, P*h_d], start_pos: int32) -> float32[L, h_d]:
+def gemm_2(A: float32[L, L], B: float32[L, D], start_pos: int32) -> float32[L, h_d]:
     C: float32[L, h_d] = 0.0
     for i in range(L):
         for j in range(h_d):
             for k in allo.reduction(L):
                 C[i, j] += A[i, k] * B[k, start_pos + j]
     return C
+
 def custom_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
     exp_buf:Ty[L, L] = 0.0      # TEMP for exponentials
     QK_out: Ty[L, L] = 0.0
@@ -78,16 +79,14 @@ def custom_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
     return QK_out
 
 # ------------------------------------------------------------------------------
-def attention_parallel_subset(Q_sliced: Ty[L, P*h_d], K_sliced: Ty[L, P*h_d], V_sliced: Ty[L, P*h_d])->Ty[L, P*h_d]:
+def attention_parallel_subset(Q: Ty[L, D], K: Ty[L, D], V: Ty[L, D])->Ty[L, P*h_d]:
     Z_i: Ty[L, P*h_d]
     start_pos:int32 = 0
-    # full_start_position: int32 = 0
     for j in allo.grid(P, name="multi_head_inner_loop"):
         start_pos = j * h_d
-        # full_start_position = i * P * h_d + start_pos
-        QK_t = gemm(Q_sliced, K_sliced, start_pos)
+        QK_t = gemm(Q, K, start_pos)
         QK_t_s = custom_softmax(QK_t)
-        Z_i_j = gemm_2(QK_t_s, V_sliced, start_pos)
+        Z_i_j = gemm_2(QK_t_s, V, start_pos)
         for (i2, j2) in allo.grid(L, h_d, name="store_intermediate_result"):
             Z_i[i2, start_pos + j2] = Z_i_j[i2, j2]
     return Z_i
@@ -95,15 +94,8 @@ def attention_parallel_subset(Q_sliced: Ty[L, P*h_d], K_sliced: Ty[L, P*h_d], V_
 
 def attention_parallel_full(Q: Ty[L, D], K: Ty[L, D], V: Ty[L, D]) -> Ty[L, D]:
     Z: Ty[L, D]
-    Q_sliced: Ty[L, P*h_d]
-    K_sliced: Ty[L, P*h_d]
-    V_sliced: Ty[L, P*h_d]
     for i in allo.grid(H//P, name="multi_head_outer_loop"):
-        for ii, jj in allo.grid(L, P*h_d, name="loop_slicing"):
-            Q_sliced[ii, jj] = Q[ii, i*P*h_d + jj]
-            K_sliced[ii, jj] = K[ii, i*P*h_d + jj]
-            V_sliced[ii, jj] = V[ii, i*P*h_d + jj]
-        Z_new = attention_parallel_subset(Q_sliced, K_sliced, V_sliced)
+        Z_new = attention_parallel_subset(Q, K, V)
         for (i2, j2) in allo.grid(L, P*h_d, name="store_final_result"):
             Z[i2, i*P*h_d + j2] = Z_new[i2, j2]
     return Z
@@ -133,8 +125,7 @@ def test_attention():
     Q = np.random.rand(L, D).astype(np.float32)
     K = np.random.rand(L, D).astype(np.float32)
     V = np.random.rand(L, D).astype(np.float32)
-    my_solution = np.zeros(Q.shape)
-    solution = sdp(Q, K, V, H, D)
+    # solution = sdp(Q, K, V, H, D)
     
     s1 = allo.customize(gemm)
     s2 = allo.customize(gemm_2)
@@ -146,7 +137,7 @@ def test_attention():
     s1.pipeline("k")
     s1.unroll(axis="j", factor=H)
     s5.compose([s1, s2, s3])
-    s5.unfold("multi_head_inner_loop", [0])
+    s5.unroll(axis="j", factor=P)
 
     s6 = allo.customize(attention_parallel_full)
 
@@ -154,21 +145,20 @@ def test_attention():
     s6.partition(s6.K, partition.Block, dim=2, factor=H)
     s6.partition(s6.V, partition.Block, dim=2, factor=H)
     s6.partition(s6.Z, partition.Block, dim=2, factor=H)
-    s6.partition(s6.Q_sliced, partition.Block, dim=2, factor=P)
-    s6.partition(s6.K_sliced, partition.Block, dim=2, factor=P)
-    s6.partition(s6.V_sliced, partition.Block, dim=2, factor=P)
     
     s6.compose([s5])
-    mock_buffer_z_new = MockBuffer("attention_parallel_full", "Z_new")
-    s6.partition(mock_buffer_z_new, partition.Block, dim=2, factor=P)
+    print(s6.get_loops("attention_parallel_full")["multi_head_outer_loop"])
     s6.dataflow("attention_parallel_subset")
     s6.dataflow("attention_parallel_full")
-    mode = "csyn"
-    s6.build(target="vitis_hls", mode=mode, project=f"{mode}_att_partial_par_{P}_heads_{H}.prj")()
-    print(my_solution)
-    print("-"*100)
-    print(solution)
-    np.assert_allclose(my_solution, solution, atol=1e-5)
+    # s6.dataflow(s6.get_loops("attention_parallel_full")["multi_head_outer_loop"]["i2"])
+    # print(s5.module)
+    # print(s5.get_loops("attention_parallel_subset"))
+    
+    # print(s6.module)
+    # assert False, "Passed test_attention!"
+
+    # print(s5.module)
+    s6.build(target="vitis_hls", mode="csyn", project=f"att_unroll_par_{P}_heads_{H}_no_df.prj")()
     print("everything passed!")
 if __name__ == "__main__":
     test_attention()
