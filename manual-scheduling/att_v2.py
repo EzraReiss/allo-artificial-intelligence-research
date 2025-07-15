@@ -1,26 +1,19 @@
 import math, allo
 import numpy as np
-from allo._mlir import ir as mlir_ir
-StringAttr = mlir_ir.StringAttr
 from allo.ir.types import float32, int32, Int, index
-from allo.autoscheduler.passes import dataflow_optimization_pass
-from allo.autoscheduler.config import AutoschedulerConfig
-from allo.autoscheduler.dfg import DFG
-from gurobipy import GurobiError
 from allo.customize import Partition as partition
 from allo.ir.utils import MockBuffer
-from allo.ir.transform import find_buffer
 
 # --------------------------------------------------------------------------------
 # Problem size: 1 head of 32 × 32 with 64-wide model dimension
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
 H, L, D = 8, 64, 1024
-P = H // 2 # parallel heads
+P = H // 1 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
-
+TILE_SIZE = 16
 
 
 import math
@@ -45,38 +38,49 @@ def gemm_2(A: float32[L, L], B: float32[L, P*h_d], start_pos: int32) -> float32[
             for k in allo.reduction(L):
                 C[i, j] += A[i, k] * B[k, start_pos + j]
     return C
-    
-def custom_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
-    exp_buf:Ty[L, L] = 0.0      # TEMP for exponentials
+
+def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     # TEMP for exponentials
     QK_out: Ty[L, L] = 0.0
-    max_vals: Ty[L] = MIN_FLOAT32
-    rows_total: Ty[L] = 0.0
-    invs: Ty[L] = 0.0
-    # --- Kernel B: scan QK_in and update max_vals in a perfect 2D nest ------
-    for ii in range(L):
-        for jj in range(L):
-            v:Ty = QK_in[ii, jj]
-            m:Ty = max_vals[ii]                   # affine.load
-            # this select lowers to arithmetic, not a branch
-            max_vals[ii] = v if v > m else m   # affine.store
+    i_arr_1: int32[L*L]
 
-    # --- Kernel C: compute exponentials and row sums (another perfect nest) -
-    for ii in range(L):
-        rows_total[ii] = 0.0
-        for jj in range(L):
-            e:Ty = allo.exp(QK_in[ii, jj] - max_vals[ii])
-            exp_buf[ii, jj] = e
-            rows_total[ii] += e
+    for i in allo.grid(L*L, name = "i"):
+        x: index = i
+        i_arr_1[i] = x
 
-    # --- Kernel D: normalise (one more perfect nest) ------------------------
-    for ii in range(L):
-        inv:Ty = 1.0 / rows_total[ii] #this does not catch a division by zero
-        invs[ii] = inv
-
-    for ii in range(L):
-        for jj in range(L):
-            QK_out[ii, jj] = exp_buf[ii, jj] * invs[ii]
+    for i_outer in allo.grid(L//TILE_SIZE, name = "i_outer"):
+        for i_inner in allo.grid(TILE_SIZE, name = "i_inner"):
+            max_val = softmax_p1(QK_in, i_arr_1[i_outer*TILE_SIZE + i_inner])
+            exp_buf_1 = softmax_p2(QK_in, max_val, i_arr_1[i_outer*TILE_SIZE + i_inner])
+            inv = softmax_p3(exp_buf_1)
+            softmax_p4(QK_out, exp_buf_1, inv, i_arr_1[i_outer*TILE_SIZE + i_inner])
     return QK_out
+
+def softmax_p1(QK_in: Ty[L, L], i_pos: int32) -> Ty:
+    local_max: Ty = MIN_FLOAT32
+    for j1 in allo.grid(L, name = "j1"):
+        if QK_in[i_pos, j1] > local_max:
+            local_max = QK_in[i_pos, j1]
+    return local_max
+
+def softmax_p2(QK_in: Ty[L, L], max_val: Ty, i_pos: int32) -> Ty[L]:
+    local_max: Ty = max_val
+    exp_buf_1: Ty[L] = 0.0
+    for j2 in allo.grid(L, name = "j2"):
+        e:Ty = allo.exp(QK_in[i_pos, j2] - local_max)
+        exp_buf_1[j2] = e
+    return exp_buf_1
+
+def softmax_p3(exp_buf: Ty[L]) -> Ty:
+    row_total: Ty = 0.0
+    for j3 in allo.grid(L, name = "j3"):
+        row_total += exp_buf[j3]
+    inv:Ty = 1.0 / row_total
+    return inv
+
+def softmax_p4(QK_out: Ty[L, L], exp_buf: Ty[L], inv: Ty, i_pos: int32):
+    for j4 in allo.grid(L, name = "result"):
+        QK_out[i_pos, j4] = exp_buf[j4] * inv
+
 
 # ------------------------------------------------------------------------------
 def attention_parallel_subset(Q_sliced: Ty[L, P*h_d], K_sliced: Ty[L, P*h_d], V_sliced: Ty[L, P*h_d])->Ty[L, P*h_d]:
@@ -87,7 +91,7 @@ def attention_parallel_subset(Q_sliced: Ty[L, P*h_d], K_sliced: Ty[L, P*h_d], V_
         start_pos = j * h_d
         # full_start_position = i * P * h_d + start_pos
         QK_t = gemm(Q_sliced, K_sliced, start_pos)
-        QK_t_s = custom_softmax(QK_t)
+        QK_t_s = softmax_top(QK_t)
         Z_i_j = gemm_2(QK_t_s, V_sliced, start_pos)
         for (i2, j2) in allo.grid(L, h_d, name="store_intermediate_result"):
             Z_i[i2, start_pos + j2] = Z_i_j[i2, j2]
@@ -129,7 +133,6 @@ def sdp(Q, K, V, H, D):
         context[:, i * h_d : (i + 1) * h_d] = context_i
     return context
 
-
 def test_attention():
     Q = np.random.rand(L, D).astype(np.float32)
     K = np.random.rand(L, D).astype(np.float32)
@@ -139,14 +142,32 @@ def test_attention():
     
     s1 = allo.customize(gemm)
     s2 = allo.customize(gemm_2)
-    s3 = allo.customize(custom_softmax)
+    soft_top = allo.customize(softmax_top)
     s5 = allo.customize(attention_parallel_subset)
+
+    soft_1 = allo.customize(softmax_p1)
+    soft_2 = allo.customize(softmax_p2)
+    soft_3 = allo.customize(softmax_p3)
+    soft_4 = allo.customize(softmax_p4)
+    soft_top = allo.customize(softmax_top)
+
+    soft_top.partition(soft_top.i_arr_1, partition_type=partition.Cyclic, dim=1, factor = 16)
+
+    soft_top.compose([soft_1, soft_2, soft_3, soft_4])
+
+    soft_top.unroll("i", 16)
+    soft_top.pipeline("i")
+    soft_top.unroll("i_outer", factor = 4)
 
     s1.reorder("k", "j")
     s1.buffer_at(s1.C, "i")
     s1.pipeline("k")
     s1.unroll(axis="j", factor=H)
-    s5.compose([s1, s2, s3])
+
+    s5.partition("attention_parallel_subset:QK_t", partition.Cyclic, dim=0, factor=4)
+    s5.partition("attention_parallel_subset:QK_t_s", partition.Cyclic, dim=0, factor=16)
+
+    s5.compose([s1, s2, soft_top])
     s5.unfold("multi_head_inner_loop", [0])
 
     s6 = allo.customize(attention_parallel_full)
