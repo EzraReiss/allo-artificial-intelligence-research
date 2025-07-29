@@ -15,7 +15,7 @@ from allo.ir.utils import MockBuffer
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
 H, L, D = 8, 64, 1024
-P = H // 4 # parallel heads
+P = H // 1 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value

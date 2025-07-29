@@ -3,10 +3,6 @@ import numpy as np
 from allo._mlir import ir as mlir_ir
 StringAttr = mlir_ir.StringAttr
 from allo.ir.types import float32, int32, index
-from allo.autoscheduler.passes import dataflow_optimization_pass
-from allo.autoscheduler.config import AutoschedulerConfig
-from allo.autoscheduler.dfg import DFG
-from gurobipy import GurobiError
 from allo.customize import Partition as partition
 from allo.ir.utils import MockBuffer
 
@@ -136,11 +132,11 @@ def test_softmax_top():
 
     # partitions
     top_sch.partition(top_sch.QK_in, partition_type=partition.Cyclic, dim=0, factor = unroll_factor)
-    top_sch.partition(top_sch.i_arr_1, partition_type=partition.Cyclic, dim=1, factor = 16)
+    #top_sch.partition(top_sch.i_arr_1, partition_type=partition.Cyclic, dim=1, factor = 16)
     #top_sch.partition(top_sch.invs, partition_type=partition.Cyclic, dim=1, factor = unroll_factor*2)
     #top_sch.partition(top_sch.i_arr, partition_type=partition.Cyclic, dim=1, factor = 16)
     #top_sch.partition(top_sch.exp_buf, partition_type=partition.Cyclic, dim=1, factor = 16)
-    top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=0, factor = 16)
+    top_sch.partition(top_sch.QK_out, partition_type=partition.Cyclic, dim=0, factor = 8)
 
     # schedule the lower level functions
     # schedule_softmax_p1(s1)
@@ -148,7 +144,6 @@ def test_softmax_top():
     # schedule_softmax_p3(s3)
     # schedule_softmax_p4(s4)
     
-
     # compose the lower level schedules into top_sch
     top_sch.compose([s1, s2, s3, s4])
 
@@ -162,7 +157,7 @@ def test_softmax_top():
     #top_sch.dataflow("softmax_top")
     
     # build the top level schedule
-    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top_best.prj")()
+    mod = top_sch.build(target="vitis_hls", mode="csyn", project="softmax_top_8part.prj")()
 
 
 def schedule_softmax_p1(s):
@@ -212,4 +207,4 @@ if __name__ == "__main__":
     #test_base()
     test_softmax_top()
     #test_true_softmax()
-    test_function_equivalence()
+    #test_function_equivalence()

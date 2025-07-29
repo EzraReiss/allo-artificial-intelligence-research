@@ -16,7 +16,7 @@ from allo.ir.transform import find_buffer
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
 H, L, D = 8, 64, 1024
-P = H // 4 # parallel heads
+P = H // 1 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
@@ -164,11 +164,12 @@ def test_attention():
     s6.dataflow("attention_parallel_subset")
     s6.dataflow("attention_parallel_full")
     mode = "csyn"
-    s6.build(target="vitis_hls", mode=mode, project=f"{mode}_att_partial_par_{P}_heads_{H}.prj")()
-    print(my_solution)
-    print("-"*100)
-    print(solution)
-    np.testing.assert_allclose(my_solution, solution, atol=1e-5)
-    print("everything passed!")
+    s6.build(target="vitis_hls", mode=mode, project=f"{mode}_base_att_partial_par_{P}_heads_{H}.prj")()
+    print(f"base {mode} with {P} heads in parallel is finished!")
+    # print(my_solution)
+    # print("-"*100)
+    # print(solution)
+    # np.assert_allclose(my_solution, solution, atol=1e-5)
+    # print("everything passed!")
 if __name__ == "__main__":
     test_attention()

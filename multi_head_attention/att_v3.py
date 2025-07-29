@@ -159,12 +159,13 @@ def test_attention():
     soft_top.compose([soft_1, soft_2, soft_3, soft_4])
     soft_top.pipeline("i_soft", initiation_interval=3)
 
-    # s1.reorder("k", "j")
-    #s1.buffer_at(s1.C, "i")
+    s1.reorder("k", "j")
+    s1.buffer_at(s1.C, "i")
     s1.pipeline("j", initiation_interval=1)
-    s1.unroll("j", 16)
+    s1.unroll("j", 16
 
-    s2.pipeline("j", initiation_interval=2)
+    s2.pipeline("k", initiation_interval=1)
+    s2.unroll("k", factor=16)
 
     s5.partition("attention_parallel_subset:QK_t", partition.Cyclic, dim=2, factor=R1)
     s5.partition("attention_parallel_subset:QK_t_s", partition.Cyclic, dim=2, factor=R2)
@@ -189,7 +190,7 @@ def test_attention():
     s6.dataflow("attention_parallel_full")
     mode = "csyn"
     #s6.build(target="vitis_hls", mode="csyn", project=f"att_partial_par_{P}_heads_{H}.prj")()
-    s6.build(target="vitis_hls", mode=mode, project=f"no_iarr_unroll_{P}_pipeline_{R1}_{R2}.prj")()
+    s6.build(target="vitis_hls", mode=mode, project=f"unroll_{P}_gemm1_mod.prj")()
     #s6.build(target="vitis_hls", mode="sw_emu", project=f"sw_no_iarr_unroll_{P}_pipeline_{R1}_{R2}.prj")(Q, K, V, my_solution)
     print(f"unrolled {R1} and {R2} in softmax")
     # print(my_solution)
