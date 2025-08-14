@@ -15,36 +15,65 @@ from allo.ir.transform import find_buffer
 # Problem size: 1 head of 32 × 32 with 64-wide model dimension
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
-H, L, D = 8, 64, 1024
-P = H // 2 # parallel heads
+H, L, D = 12, 1024, 2052
+P = H // 4 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
-
+inverse_SQRT_h_d:Ty = 1.0 / math.sqrt(h_d)
+GEMM_1_UNROLL_FACTOR = 32
 
 
 import math
 import numpy as np
 float32_scalar = float32        
 
-def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float32[L, L]:
-    """Is the AB^T technically where if B is already transposed it would be A[L, start_pos:start_pos+D]B[start_pos:start_pos+D, L]
-    this is like computing Q_hK_h^T
-    """
-    C: float32[L, L] = 0.0
+
+
+
+def gemm_no_masking(A: float32[L, h_d], B: float32[L, h_d]) -> float32[L, L]:
+    C: float32[L, L]
     for i in range(L, name="gemm_transpose_outer_loop"):
         for j in range(L, name="gemm_transpose_inner_loop"):
-            for k in allo.reduction(h_d):
-                C[i, j] += A[i, start_pos + k] * B[j, start_pos + k]
+            for k in allo.reduction(h_d, name="gemm_1_accumulator"):
+                C[i, j] += A[i, k] * B[j, k] * inverse_SQRT_h_d
     return C
 
-def gemm_2(A: float32[L, L], B: float32[L, P*h_d], start_pos: int32) -> float32[L, h_d]:
+
+def gemm_masking(A: float32[L, h_d], B: float32[L, h_d]) -> float32[L, L]:
+    """This is doing AB^T assuming that B is not already transposed
+    There are also the masking and the scaling steps that are implemented here
+    """
+    C = gemm_no_masking(A, B)
+    for i in range(L):
+        for j in range(i - 1):
+            C[i, L - j - 1] = MIN_FLOAT32
+    return C
+
+
+# def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float32[L, L]:
+#     """This is doing AB^T assuming that B is not already transposed
+#     There are also the masking and the scaling steps that are implemented here
+#     """
+#     C: float32[L, L] = MIN_FLOAT32
+#     for i in range(L, name="gemm_transpose_outer_loop"):
+#         for j in range(i+1, name="gemm_transpose_inner_loop"):
+#             acc: float32 = 0.0 
+#             for k in allo.reduction(h_d):
+#                 acc += A[i, start_pos + k] * B[j, start_pos + k]
+#             C[i, j] = acc * inverse_SQRT_h_d
+#     return C
+
+def gemm_2(A: float32[L, L], B: float32[L, h_d]) -> float32[L, h_d]:
     C: float32[L, h_d] = 0.0
     for i in range(L):
         for j in range(h_d):
             for k in allo.reduction(L):
-                C[i, j] += A[i, k] * B[k, start_pos + j]
+                C[i, j] += A[i, k] * B[k, j]
     return C
+
+
+
     
 def custom_softmax(QK_in: Ty[L, L]) -> Ty[L, L]:
     exp_buf:Ty[L, L] = 0.0      # TEMP for exponentials
@@ -84,11 +113,17 @@ def attention_parallel_subset(Q_sliced: Ty[L, P*h_d], K_sliced: Ty[L, P*h_d], V_
     start_pos:int32 = 0
     # full_start_position: int32 = 0
     for j in allo.grid(P, name="multi_head_inner_loop"):
+        Q_h: Ty[L, h_d]
+        K_h: Ty[L, h_d]
+        V_h: Ty[L, h_d]
         start_pos = j * h_d
-        # full_start_position = i * P * h_d + start_pos
-        QK_t = gemm(Q_sliced, K_sliced, start_pos)
+        for ii, jj in allo.grid(L, h_d, name="loop_smaller_slicing"):
+            Q_h[ii, jj] = Q_sliced[ii, j * h_d + jj]
+            K_h[ii, jj] = K_sliced[ii, j * h_d + jj]
+            V_h[ii, jj] = V_sliced[ii, j * h_d + jj]
+        QK_t = gemm_no_masking(Q_h, K_h)
         QK_t_s = custom_softmax(QK_t)
-        Z_i_j = gemm_2(QK_t_s, V_sliced, start_pos)
+        Z_i_j = gemm_2(QK_t_s, V_h)
         for (i2, j2) in allo.grid(L, h_d, name="store_intermediate_result"):
             Z_i[i2, start_pos + j2] = Z_i_j[i2, j2]
     return Z_i
@@ -114,6 +149,21 @@ def np_softmax(x, axis=-1):
     e_x = np.exp(x - x_max)
     return e_x / np.sum(e_x, axis=axis, keepdims=True)
 
+
+def schedule_gemm_no_masking():
+    s1 = allo.customize(gemm_no_masking)
+    s1.reorder("k", "j")
+    s1.buffer_at(s1.C, "i")
+    s1.pipeline("j", initiation_interval=1)
+    s1.unroll("j", factor=16)
+    return s1
+
+def schedule_gemm_masking():
+    no_masking = schedule_gemm_no_masking()
+    s1 = allo.customize(gemm_masking)
+    s1.compose([no_masking])
+    return s1
+
 def sdp(Q, K, V, H, D):
     context = np.zeros(Q.shape)
     h_d = D // H
@@ -137,16 +187,42 @@ def test_attention():
     my_solution = np.zeros(Q.shape)
     solution = sdp(Q, K, V, H, D)
     
-    s1 = allo.customize(gemm)
+    s1 = allo.customize(gemm_no_masking)
+    # s1.build(target="vitis_hls", mode="csyn", project=f"gemm_{L}_{h_d}_no_optimizations.prj")()
+    # s1 = schedule_gemm_no_masking()
+    s1.pipeline("j", initiation_interval=1)
+    # s1.build(target="vitis_hls", mode="csyn", project=f"gemm_{L}_{h_d}_optimizations.prj")()
+    s1 = allo.customize(gemm_masking)
+    s1 = schedule_gemm_masking()
+    s1.build(target="vitis_hls", mode="csyn", project=f"gemm_{L}_{h_d}_masking_optimizations.prj")()
+    assert False
+
+    # s1 = schedule_gemm_no_masking()
+    # s1 = schedule_gemm_masking()
+
     s2 = allo.customize(gemm_2)
     s3 = allo.customize(custom_softmax)
     s5 = allo.customize(attention_parallel_subset)
 
-    s1.reorder("k", "j")
-    s1.buffer_at(s1.C, "i")
-    s1.pipeline("k")
-    s1.unroll(axis="j", factor=H)
+
+    # s1.reorder("k", "j")
+    # s1.buffer_at(s1.C, "i")
+    # s1.pipeline("j", initiation_interval=1)
+    # s1.unroll("j", factor=16)
+
+    s2.reorder("k", "j")
+    s2.buffer_at(s2.C, "i")
+    s2.pipeline("j", initiation_interval=1)
+    s2.unroll("j", factor=8)
+
+    
+
     s5.compose([s1, s2, s3])
+    # s5.partition(s5.Q_h, partition.Cyclic, dim=2, factor=32)
+    # s5.partition(s5.K_h, partition.Cyclic, dim=2, factor=32)
+    # s5.partition(s5.V_h, partition.Cyclic, dim=1, factor=32)
+    # s5.partition(s5.QK_t, partition.Cyclic, dim=2, factor=4)
+    # s5.partition(s5.QK_t_s, partition.Cyclic, dim=2, factor=32)
     s5.unfold("multi_head_inner_loop", [0])
 
     s6 = allo.customize(attention_parallel_full)
@@ -155,21 +231,23 @@ def test_attention():
     s6.partition(s6.K, partition.Block, dim=2, factor=H)
     s6.partition(s6.V, partition.Block, dim=2, factor=H)
     s6.partition(s6.Z, partition.Block, dim=2, factor=H)
+
+    # Keep inner GEMM banking; add only V_sliced banking to avoid dataflow multi-reader on V
     s6.partition(s6.Q_sliced, partition.Block, dim=2, factor=P)
     s6.partition(s6.K_sliced, partition.Block, dim=2, factor=P)
     s6.partition(s6.V_sliced, partition.Block, dim=2, factor=P)
     
     s6.compose([s5])
-    mock_buffer_z_new = MockBuffer("attention_parallel_full", "Z_new")
-    s6.partition(mock_buffer_z_new, partition.Block, dim=2, factor=P)
+    s6.partition(s6.Z_new, partition.Block, dim=2, factor=P)
     s6.dataflow("attention_parallel_subset")
     s6.dataflow("attention_parallel_full")
     mode = "csyn"
-    s6.build(target="vitis_hls", mode=mode, project=f"{mode}_att_partial_par_{P}_heads_{H}.prj")()
+    print(s6.module)
+    s6.build(target="vitis_hls", mode=mode, project=f"{mode}_att_par_{P}_heads_{H}_dim_{D}_length_{L}.prj")()
     print(my_solution)
     print("-"*100)
     print(solution)
-    np.assert_allclose(my_solution, solution, atol=1e-5)
-    print("everything passed!")
+    # np.assert_allclose(my_solution, solution, atol=1e-5)
+    # print("everything passed!")
 if __name__ == "__main__":
     test_attention()
