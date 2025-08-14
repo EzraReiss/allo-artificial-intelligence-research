@@ -23,29 +23,61 @@ MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
 TILE_SIZE = 16
 R1 = 8
 R2 = 16 * (L//64)
+inverse_sqrt_h_d = 1.0 / math.sqrt(h_d)
 softmax_p3_row_totals = 8
+
 import math
 import numpy as np
 float32_scalar = float32        
-inverse_sqrt_h_d = 1.0 / math.sqrt(h_d)
 
-def gemm(A: Ty[L, P*h_d], B: Ty[L, P*h_d], start_pos: int32) -> Ty[L, L]:
-    """Is the AB^T technically where if B is already transposed it would be A[L, start_pos:start_pos+D]B[start_pos:start_pos+D, L]
-    this is like computing Q_hK_h^T
+# def gemm(A: Ty[L, P*h_d], B: Ty[L, P*h_d], start_pos: int32) -> Ty[L, L]:
+#     """Is the AB^T technically where if B is already transposed it would be A[L, start_pos:start_pos+D]B[start_pos:start_pos+D, L]
+#     this is like computing Q_hK_h^T
+#     """
+#     C: Ty[L, L] = MIN_FLOAT32
+#     for i in range(L, name="gemm_transpose_outer_loop"):
+#         for j in range(i + 1, name="gemm_transpose_inner_loop"):
+#             acc: Ty = 0.0
+#             for k in allo.reduction(h_d):
+#                 acc += A[i, start_pos + k] * B[j, start_pos + k]
+#             C[i, j] = acc * inverse_sqrt_h_d
+#     return C
+
+def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float32[L, L]:
+    """This is doing AB^T assuming that B is not already transposed
+    There are also the masking and the scaling steps that are implemented here
     """
-    C: Ty[L, L] = 0.0
+    C: float32[L, L] = MIN_FLOAT32
     for i in range(L, name="gemm_transpose_outer_loop"):
-        for j in range(L, name="gemm_transpose_inner_loop"):
+        for j in range(i+1, name="gemm_transpose_inner_loop"):
+            acc: float32[8] = 0.0 
             for k in allo.reduction(h_d):
-                C[i, j] += A[i, start_pos + k] * B[j, start_pos + k] * inverse_sqrt_h_d
+                acc[k % 8] += A[i, start_pos + k] * B[j, start_pos + k] * inverse_sqrt_h_d
+            for l in range(8):
+                C[i, j] = acc[l % 8]
     return C
 
+# def gemm(A: float32[L, P*h_d], B: float32[L, P*h_d], start_pos: int32) -> float32[L, L]:
+#     """This is doing AB^T assuming that B is not already transposed
+#     There are also the masking and the scaling steps that are implemented here
+#     """
+#     C: float32[L, L] = MIN_FLOAT32
+#     for i in range(L, name="gemm_transpose_outer_loop"):
+#         for j in range(i+1, name="gemm_transpose_inner_loop"):
+#             acc:Ty = 0.0 #Read write issues on this
+#             for k in allo.reduction(h_d):
+#                 acc += A[i, start_pos + k] * B[j, start_pos + k]
+#             C[i, j] = acc * inverse_sqrt_h_d
+#     return C
+
 def gemm_2(A: Ty[L, L], B: Ty[L, P*h_d], start_pos: int32) -> Ty[L, h_d]:
-    C: Ty[L, h_d] = 0.0
-    for i in range(L, name="gemm_2_outer_loop"):
-        for j in range(h_d, name="gemm_2_inner_loop"):
-            for k in allo.reduction(L, name="gemm_2_reduction"):
-                C[i, j] += A[i, k] * B[k, start_pos + j]
+    C: Ty[L, h_d]
+    for i in range(L):
+        for j in range(h_d):
+            D: Ty = 0.0
+            for k in allo.reduction(L):
+                D += A[i, k] * B[k, start_pos + j]
+            C[i, j] = D
     return C
 
 def softmax_top(QK_in: Ty[L, L]) -> Ty[L, L]:     # TEMP for exponentials
@@ -72,14 +104,6 @@ def softmax_p2(QK_in: Ty[L, L], max_val: Ty, i_pos: index) -> Ty[L]:
         exp_buf_1[j2] = e
     return exp_buf_1
 
-# def softmax_p3(exp_buf: Ty[L]) -> Ty:
-#     row_total: Ty = 0.0
-#     for j3 in allo.grid(L, name = "j3"):
-#         row_total += exp_buf[j3]
-#     inv:Ty = 1.0 / row_total
-#     return inv
-
-
 def softmax_p3(exp_buf: Ty[L]) -> Ty:
     row_totals: Ty[softmax_p3_row_totals] = 0.0
     partial_sum_0: Ty = 0.0
@@ -98,6 +122,20 @@ def softmax_p3(exp_buf: Ty[L]) -> Ty:
     total_sum = partial_sum_0 + partial_sum_1 + partial_sum_2 + partial_sum_3
     inv:Ty = 1.0 / total_sum
     return inv
+
+# def softmax_p3(exp_buf: Ty[L]) -> Ty:
+#     row_totals: Ty[softmax_p3_row_totals] = 0.0
+#     total_sum: Ty = 0.0
+#     row_totals_index: int32 = 0
+#     for j3 in allo.reduction(L, name = "j3"):
+#         row_totals_index = j3 % softmax_p3_row_totals
+#         row_totals[row_totals_index] += exp_buf[j3]
+
+    
+#     for k3 in allo.reduction(softmax_p3_row_totals):
+#         total_sum += row_totals[k3]
+#     inv:Ty = 1.0 / total_sum
+#     return inv
 
 def softmax_p4(QK_out: Ty[L, L], exp_buf: Ty[L], inv: Ty, i_pos: index):
     for j4 in allo.grid(L, name = "result"):
@@ -161,18 +199,7 @@ def test_attention():
     solution = sdp(Q, K, V, H, D)
     
     s1 = allo.customize(gemm)
-    s1.reorder("k", "j")
-    s1.buffer_at(s1.C, "i")
-    s1.pipeline("j", initiation_interval=1)
-    s1.unroll("j", factor=16)
-    
     s2 = allo.customize(gemm_2)
-    s2.reorder("k", "j")
-    s2.buffer_at(s2.C, "i")
-    s2.pipeline("j", initiation_interval=1)
-    s2.unroll("j", factor=8)
-
-    
     soft_top = allo.customize(softmax_top)
     s5 = allo.customize(attention_parallel_subset)
 
@@ -183,20 +210,27 @@ def test_attention():
 
     soft_1.pipeline("j1", initiation_interval=1)
     soft_2.pipeline("j2", initiation_interval=1)
-    soft_2.unroll("j2", factor=4)
     soft_3.pipeline("j3", initiation_interval=1)
+    #soft_3.unroll("j3", factor=8)
     soft_4.pipeline("j4", initiation_interval=1)
 
     soft_top.compose([soft_1, soft_2, soft_3, soft_4])
-    #soft_top.pipeline("i_soft", initiation_interval=200)
-    soft_top.partition("softmax_top:exp_buf_1", partition.Cyclic, dim=1, factor=4)
+    #soft_top.pipeline("i_soft", initiation_interval=3)
+    # soft_top.unroll("i_soft", factor=2)
+    # s1.reorder("k", "j")
+    # s1.buffer_at(s1.C, "i")
+    # s1.pipeline("j", initiation_interval=1)
+    # s1.unroll("j", factor=8)
+    s1.partition(s1.acc, partition.Complete)
+    s1.pipeline("k")
 
-    #print(s1.module)
 
-    #s2.pipeline("j", initiation_interval=1)
+    s2.pipeline("j", initiation_interval=1)
+    #s2.unroll("k", factor=16)
 
     s5.partition("attention_parallel_subset:QK_t", partition.Cyclic, dim=2, factor=R1)
     s5.partition("attention_parallel_subset:QK_t_s", partition.Cyclic, dim=2, factor=R2)
+
     s5.compose([s1, s2, soft_top])
     s5.unfold("multi_head_inner_loop", [0])
 
@@ -211,15 +245,16 @@ def test_attention():
     s6.partition(s6.V_sliced, partition.Block, dim=0, factor=P)
     
     s6.compose([s5])
-    #mock_buffer_z_new = MockBuffer("attention_parallel_full", "Z_new")
-    s6.partition(s6.Z_new, partition.Block, dim=2, factor=P)
+    mock_buffer_z_new = MockBuffer("attention_parallel_full", "Z_new")
+    s6.partition(mock_buffer_z_new, partition.Block, dim=2, factor=P)
     s6.dataflow("attention_parallel_subset")
     s6.dataflow("attention_parallel_full")
     mode = "csyn"
     #s6.build(target="vitis_hls", mode="csyn", project=f"att_partial_par_{P}_heads_{H}.prj")()
-    s6.build(target="vitis_hls", mode=mode, project=f"gemm_2_mod.prj")()
+    s6.build(target="vitis_hls", mode=mode, project=f"unroll_{P}_tri_gemm.prj")()
     #s6.build(target="vitis_hls", mode="sw_emu", project=f"sw_no_iarr_unroll_{P}_pipeline_{R1}_{R2}.prj")(Q, K, V, my_solution)
-    print(f"unrolled {R1} and {R2} in softmax")
+    #print(f"unrolled {R1} and {R2} in softmax")
+    print("softmax_p3 modified")
     # print(my_solution)
     # print("-"*100)
     # print(solution)
