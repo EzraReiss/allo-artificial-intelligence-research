@@ -15,8 +15,8 @@ from allo.ir.transform import find_buffer
 # Problem size: 1 head of 32 × 32 with 64-wide model dimension
 # (easy to synthesize quickly; raise L/D/H for bigger experiments)
 # --------------------------------------------------------------------------------
-H, L, D = 12, 512, 768
-P = H // 4 # parallel heads
+H, L, D = 12, 128, 768
+P = H // 12 # parallel heads
 h_d:int32 = D // H
 Ty = float32
 MIN_FLOAT32:Ty = -3.402823466e+38  # minimum float32 value
@@ -202,9 +202,10 @@ def test_attention():
 
     soft_1.pipeline("j1", initiation_interval=1)
     soft_2.pipeline("j2", initiation_interval=1)
-    soft_2.unroll("j2", factor=4)
+    soft_2.unroll("j2", factor=8)
     soft_3.pipeline("j3", initiation_interval=1)
     soft_4.pipeline("j4", initiation_interval=1)
+    soft_4.unroll("j4", factor=8)
 
     soft_top.compose([soft_1, soft_2, soft_3, soft_4])
     soft_top.partition("softmax_top:exp_buf_1", partition.Cyclic, dim=1, factor=4)
@@ -242,7 +243,7 @@ def test_attention():
     s6.dataflow("attention_parallel_subset")
     s6.dataflow("attention_parallel_full")
     mode = "csyn"
-    #print(s6.module)
+    print(f"running {P} heads")
     s6.build(target="vitis_hls", mode=mode, project=f"{mode}_att_par_{P}_heads_{H}_dim_{D}_length_{L}.prj")()
     print(my_solution)
     print("-"*100)

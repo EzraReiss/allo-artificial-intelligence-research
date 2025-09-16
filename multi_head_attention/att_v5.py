@@ -37,10 +37,8 @@ def gemm(A: float32[L, h_d], B: float32[L, h_d]) -> float32[L, L]:
     C: float32[L, L] = MIN_FLOAT32
     for i in range(L, name="gemm_transpose_outer_loop"):
         for j in range(i+1, name="gemm_transpose_inner_loop"):
-            acc: float32 = 0.0 
             for k in allo.reduction(h_d):
-                acc += A[i, k] * B[j, k] * inverse_SQRT_h_d
-            C[i, j] = acc
+                C[i, j] += A[i, k] * B[j, k] * inverse_SQRT_h_d
     return C
 
 
